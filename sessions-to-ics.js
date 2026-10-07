@@ -34,6 +34,8 @@ const CATALOG_URL = 'https://catalog.awsevents.com/api/sessions';
 const CATALOG_PAGE_SIZE = 50;
 const CATALOG_WIDGET_ID = 'yloMDinvijFk6PtNtWambWamU6mPKiRf';
 const CATALOG_FILE = 'sessions.json';
+const CATALOG_SEARCH_URL = 'https://registration.awsevents.com/flow/awsevents/reinvent2026/event-catalog/page/eventCatalog';
+const EVENT_TIMEZONE = 'America/Los_Angeles';
 
 // Load the configuration file and show help if any required value is missing
 function loadConfig() {
@@ -256,15 +258,32 @@ function toCsvDateTime(unixTimeSec) {
     return { day: date.toFormat("EEE"), time: date.toFormat("HH:mm") }
 }
 
-function sessionToIcs(session) {
+// e.g. "Tue, Dec 1 · 1:30 PM – 2:30 PM PT (60 min)"
+function formatTimeRange(startSec, endSec) {
+    const start = DateTime.fromSeconds(startSec).setZone(EVENT_TIMEZONE);
+    const end = DateTime.fromSeconds(endSec).setZone(EVENT_TIMEZONE);
+    const minutes = Math.round(end.diff(start, 'minutes').minutes);
+    return `${start.toFormat('ccc, LLL d · h:mm a')} – ${end.toFormat('h:mm a')} PT (${minutes} min)`;
+}
+
+// status is { reserved, favorite } for the session in the user's agenda
+function sessionToIcs(session, status = {}) {
     const sessionType = session.sessionType;
     const withPrefix = (s, sep) => s ? `${sep}${s}` : '';
     const formatSpeaker = (s) => `${s.name}${withPrefix(s.jobTitle, ' - ')}${withPrefix(s.company, ' - ')}`;
-    const speakers = session.speakers?.map(formatSpeaker);
-    const topics = session.topics?.sort()?.join(', ') ?? '';
-    const areasOfInterest = session.areasOfInterest?.sort()?.join(', ') ?? '';
+    const speakers = session.speakers?.map(formatSpeaker) ?? [];
+    const list = (values) => [...(values ?? [])].sort().join(', ');
     const locationParts = [session.venue, session.room].filter((part) => typeof part === 'string' && part.length > 0);
     const location = locationParts.join(' | ');
+    // The catalog has no per-session page; searching by code narrows it to the one session card
+    const url = session.sessionId
+        ? `${CATALOG_SEARCH_URL}?search=${encodeURIComponent(session.code.toLowerCase())}`
+        : undefined;
+    const flags = [
+        status.reserved && 'Reserved',
+        status.favorite && 'Favorite',
+        session.walkUpOnly && 'Walk-up only',
+    ].filter(Boolean).join(' · ');
 
     const event = {
         start: toIcsDateTime(session.start),
@@ -272,14 +291,36 @@ function sessionToIcs(session) {
         end: toIcsDateTime(session.end),
         location,
         title: `${session.code} - ${session.title}`,
+        status: status.reserved ? 'CONFIRMED' : 'TENTATIVE',
+        busyStatus: status.reserved ? 'BUSY' : 'FREE',
         description: [
-            `${sessionType}\nCapacity: ${session.capacity}`,
-            withPrefix(topics, 'Topics: '),
-            withPrefix(areasOfInterest, 'Areas of Interest: '),
+            [
+                formatTimeRange(session.start, session.end),
+                [session.venue, session.room].filter(Boolean).join(' — '),
+                flags,
+            ].filter(Boolean).join('\n'),
+            [
+                [sessionType, list(session.levels)].filter(Boolean).join(' · '),
+                withPrefix(list(session.features), 'Features: '),
+                session.capacity ? `Capacity: ${session.capacity}` : '',
+            ].filter(Boolean).join('\n'),
+            [
+                withPrefix(list(session.topics), 'Topics: '),
+                withPrefix(list(session.areasOfInterest), 'Areas of Interest: '),
+                withPrefix(list(session.roles), 'Roles: '),
+            ].filter(Boolean).join('\n'),
             session.abstract,
-            speakers?.join('\n'),
-        ].filter(exists).join('\n\n'),
+            speakers.length > 0 ? `Speakers:\n${speakers.join('\n')}` : '',
+            url,
+        ].filter(Boolean).join('\n\n'),
     };
+    // A stable UID lets calendars update an imported event instead of duplicating it
+    if (session.uid) {
+        event.uid = session.uid;
+    }
+    if (url) {
+        event.url = url;
+    }
     return { sessionType, event };
 }
 
@@ -403,8 +444,14 @@ function parseConferenceSession(session, catalog) {
 
     return {
         code,
+        sessionId: session.sessionID,
+        uid: sessionTime.sessionTimeID ? `${sessionTime.sessionTimeID}@reinvent-sessions` : undefined,
         title: session.title ?? 'Untitled Session',
         sessionType,
+        levels: resolveAttribute(session, catalogEntry, 'Level'),
+        features: resolveAttribute(session, catalogEntry, 'Features'),
+        roles: resolveAttribute(session, catalogEntry, 'Role'),
+        walkUpOnly: resolveAttribute(session, catalogEntry, 'Walkuponlysession').length > 0,
         abstract: session.abstract ?? '',
         speakers: session.participants?.map((p) => ({
             name: p.fullName,
@@ -446,6 +493,7 @@ function parsePersonalTime(session) {
 
     return {
         code: 'PERS',
+        uid: exists(session.calendarItemId) ? `${session.calendarItemId}@reinvent-sessions` : undefined,
         title,
         sessionType: 'Personal Time',
         abstract: session.abstract ?? '',
@@ -482,10 +530,15 @@ async function exportSessions(options, command) {
 
     const catalog = await loadCatalog(catalogDir);
     const {reserved, interests} = await fetchAgenda(options, catalog);
+    const reservedIds = new Set(reserved.map((s) => s.sessionId).filter(exists));
+    const favoriteIds = new Set(interests.map((s) => s.sessionId).filter(exists));
 
     if (!options.reservedOnly) {
         const events = {};
-        interests.map(sessionToIcs).forEach(({sessionType, event}) => {
+        interests.map((s) => sessionToIcs(s, {
+            reserved: reservedIds.has(s.sessionId),
+            favorite: true,
+        })).forEach(({sessionType, event}) => {
             if (!events.hasOwnProperty(sessionType)) {
                 events[sessionType] = [];
             }
@@ -504,7 +557,10 @@ async function exportSessions(options, command) {
     }
 
     if (reserved.length > 0) {
-        writeEvents(reserved.map((r) => sessionToIcs(r).event), outputDir, "reserved");
+        writeEvents(reserved.map((r) => sessionToIcs(r, {
+            reserved: true,
+            favorite: favoriteIds.has(r.sessionId),
+        }).event), outputDir, "reserved");
     }
 }
 
